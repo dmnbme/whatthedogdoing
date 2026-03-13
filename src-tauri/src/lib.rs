@@ -4,6 +4,8 @@ use std::thread;
 
 use chrono::Local;
 use rusqlite::{params, Connection};
+use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
+use tauri::tray::TrayIconBuilder;
 use tauri::{AppHandle, Emitter, Manager, State};
 use tauri_plugin_global_shortcut::{
     Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutState,
@@ -174,37 +176,108 @@ fn fun_fallback(total_keys: u64, wpm: u32) -> String {
     )
 }
 
+// ── Keycode mapping ────────────────────────────────────────────────────────
+
+fn macos_keycode_to_name(code: u16) -> &'static str {
+    match code {
+        0 => "KeyA", 1 => "KeyS", 2 => "KeyD", 3 => "KeyF", 4 => "KeyH",
+        5 => "KeyG", 6 => "KeyZ", 7 => "KeyX", 8 => "KeyC", 9 => "KeyV",
+        11 => "KeyB", 12 => "KeyQ", 13 => "KeyW", 14 => "KeyE", 15 => "KeyR",
+        16 => "KeyY", 17 => "KeyT",
+        18 => "Digit1", 19 => "Digit2", 20 => "Digit3", 21 => "Digit4",
+        22 => "Digit6", 23 => "Digit5", 24 => "Equal", 25 => "Digit9",
+        26 => "Digit7", 27 => "Minus", 28 => "Digit8", 29 => "Digit0",
+        30 => "BracketRight", 31 => "KeyO", 32 => "KeyU", 33 => "BracketLeft",
+        34 => "KeyI", 35 => "KeyP", 36 => "Return", 37 => "KeyL",
+        38 => "KeyJ", 39 => "Quote", 40 => "KeyK", 41 => "Semicolon",
+        42 => "Backslash", 43 => "Comma", 44 => "Slash", 45 => "KeyN",
+        46 => "KeyM", 47 => "Period",
+        48 => "Tab", 49 => "Space", 50 => "Backquote", 51 => "Backspace",
+        53 => "Escape",
+        54 => "MetaRight", 55 => "MetaLeft",
+        56 => "ShiftLeft", 57 => "CapsLock", 58 => "Alt", 59 => "ControlLeft",
+        60 => "ShiftRight", 61 => "AltRight", 62 => "ControlRight", 63 => "Fn",
+        96 => "F5", 97 => "F6", 98 => "F7", 99 => "F3", 100 => "F8",
+        101 => "F9", 103 => "F11", 109 => "F10", 111 => "F12",
+        118 => "F4", 120 => "F2", 122 => "F1",
+        115 => "Home", 116 => "PageUp", 117 => "Delete",
+        119 => "End", 121 => "PageDown",
+        123 => "ArrowLeft", 124 => "ArrowRight", 125 => "ArrowDown", 126 => "ArrowUp",
+        _ => "Unknown",
+    }
+}
+
 // ── Keyboard listener ──────────────────────────────────────────────────────
 
 fn start_keyboard_listener(app: AppHandle, db_path: std::path::PathBuf) {
+    use std::collections::HashSet;
+    use std::sync::Arc;
+
     thread::spawn(move || {
-        use rdev::{listen, Event, EventType};
+        use block2::RcBlock;
+        use objc2_app_kit::{NSEvent, NSEventType};
+        use objc2_foundation::NSRunLoop;
 
-        let conn = Connection::open(&db_path).expect("listener db open failed");
-        let mut flush_counter = 0u32;
+        let conn = Arc::new(Mutex::new(
+            Connection::open(&db_path).expect("listener db open failed"),
+        ));
+        let conn_b = conn.clone();
 
-        let callback = move |event: Event| {
-            if let EventType::KeyPress(key) = event.event_type {
-                let count = KEYPRESS_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+        let flush_counter = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let flush_b = flush_counter.clone();
 
-                let payload = KeyPressPayload {
-                    count,
-                    key: format!("{:?}", key),
-                };
+        // Track pressed modifier keys to distinguish press from release
+        let pressed_mods: Arc<Mutex<HashSet<u16>>> =
+            Arc::new(Mutex::new(HashSet::new()));
+        let pressed_b = pressed_mods.clone();
 
-                let _ = app.emit("key-press", payload);
+        let block = RcBlock::new(move |event: std::ptr::NonNull<NSEvent>| {
+            let event: &NSEvent = unsafe { event.as_ref() };
+            let key_code = unsafe { event.keyCode() };
 
-                flush_counter += 1;
-                if flush_counter >= 20 {
-                    flush_counter = 0;
-                    save_today_count(&conn, count);
+            let is_press = unsafe {
+                match event.r#type() {
+                    NSEventType::KeyDown => true,
+                    NSEventType::FlagsChanged => {
+                        let mut pressed = pressed_b.lock().unwrap();
+                        if pressed.contains(&key_code) {
+                            pressed.remove(&key_code);
+                            false // release
+                        } else {
+                            pressed.insert(key_code);
+                            true // press
+                        }
+                    }
+                    _ => false,
                 }
+            };
+
+            if !is_press {
+                return;
             }
+
+            let key_name = macos_keycode_to_name(key_code).to_string();
+            let count = KEYPRESS_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+            let _ = app.emit("key-press", KeyPressPayload { count, key: key_name });
+
+            let n = flush_b.fetch_add(1, Ordering::Relaxed) + 1;
+            if n % 20 == 0 {
+                save_today_count(&conn_b.lock().unwrap(), count);
+            }
+        });
+
+        // KeyDown = 1<<10, FlagsChanged = 1<<12
+        let mask: u64 = (1u64 << 10) | (1u64 << 12);
+        let _monitor: Option<objc2::rc::Retained<objc2::runtime::AnyObject>> = unsafe {
+            objc2::msg_send_id![
+                objc2::class!(NSEvent),
+                addGlobalMonitorForEventsMatchingMask: mask,
+                handler: &*block
+            ]
         };
 
-        if let Err(e) = listen(callback) {
-            eprintln!("rdev error: {:?}", e);
-        }
+        // Block this thread on its run loop so events are delivered
+        unsafe { NSRunLoop::currentRunLoop().run() };
     });
 }
 
@@ -263,6 +336,30 @@ pub fn run() {
                 app.global_shortcut()
                     .register(shortcut)
                     .map_err(|e| e.to_string())?;
+
+                let debug_border_item = MenuItem::with_id(app, "debug_border", "🔲 显示窗口边框", true, None::<&str>)?;
+                let ai_item = MenuItem::with_id(app, "ai", "✨ what the dog doin?", true, None::<&str>)?;
+                let stats_item = MenuItem::with_id(app, "stats", "📊 详情统计", true, None::<&str>)?;
+                let passthrough_item = MenuItem::with_id(app, "passthrough", "🫥 切换穿透", true, None::<&str>)?;
+                let sep = PredefinedMenuItem::separator(app)?;
+                let quit_item = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
+
+                let sep2 = PredefinedMenuItem::separator(app)?;
+                let menu = Menu::with_items(app, &[&ai_item, &stats_item, &passthrough_item, &sep, &debug_border_item, &sep2, &quit_item])?;
+
+                TrayIconBuilder::new()
+                    .icon(app.default_window_icon().unwrap().clone())
+                    .menu(&menu)
+                    .show_menu_on_left_click(true)
+                    .on_menu_event(|app, event| match event.id.as_ref() {
+                        "quit" => app.exit(0),
+                        "ai" => { let _ = app.emit("tray-ai-analysis", ()); }
+                        "stats" => { let _ = app.emit("tray-open-stats", ()); }
+                        "passthrough" => { let _ = app.emit("toggle-pass-through", ()); }
+                        "debug_border" => { let _ = app.emit("toggle-debug-border", ()); }
+                        _ => {}
+                    })
+                    .build(app)?;
             }
 
             Ok(())

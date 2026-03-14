@@ -1,5 +1,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
+
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 use std::thread;
 
 use chrono::Local;
@@ -7,6 +9,8 @@ use rusqlite::{params, Connection};
 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::TrayIconBuilder;
 use tauri::{AppHandle, Emitter, Manager, State};
+
+#[cfg(desktop)]
 use tauri_plugin_global_shortcut::{
     Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutState,
 };
@@ -15,13 +19,12 @@ static KEYPRESS_COUNT: AtomicU64 = AtomicU64::new(0);
 
 struct Db(Mutex<Connection>);
 
+#[cfg_attr(not(any(target_os = "macos", target_os = "windows")), allow(dead_code))]
 #[derive(Clone, serde::Serialize)]
 struct KeyPressPayload {
     count: u64,
     key: String,
 }
-
-// ── DB init ────────────────────────────────────────────────────────────────
 
 fn init_db(conn: &Connection) {
     conn.execute_batch(
@@ -65,8 +68,6 @@ fn save_today_count(conn: &Connection, count: u64) {
         params![today, count as i64, now],
     );
 }
-
-// ── Tauri commands ─────────────────────────────────────────────────────────
 
 #[tauri::command]
 fn get_keypress_count() -> u64 {
@@ -176,8 +177,7 @@ fn fun_fallback(total_keys: u64, wpm: u32) -> String {
     )
 }
 
-// ── Keycode mapping ────────────────────────────────────────────────────────
-
+#[cfg(target_os = "macos")]
 fn macos_keycode_to_name(code: u16) -> &'static str {
     match code {
         0 => "KeyA", 1 => "KeyS", 2 => "KeyD", 3 => "KeyF", 4 => "KeyH",
@@ -207,8 +207,104 @@ fn macos_keycode_to_name(code: u16) -> &'static str {
     }
 }
 
-// ── Keyboard listener ──────────────────────────────────────────────────────
+#[cfg(target_os = "windows")]
+fn windows_key_to_name(key: rdev::Key) -> &'static str {
+    use rdev::Key;
 
+    match key {
+        Key::KeyA => "KeyA",
+        Key::KeyB => "KeyB",
+        Key::KeyC => "KeyC",
+        Key::KeyD => "KeyD",
+        Key::KeyE => "KeyE",
+        Key::KeyF => "KeyF",
+        Key::KeyG => "KeyG",
+        Key::KeyH => "KeyH",
+        Key::KeyI => "KeyI",
+        Key::KeyJ => "KeyJ",
+        Key::KeyK => "KeyK",
+        Key::KeyL => "KeyL",
+        Key::KeyM => "KeyM",
+        Key::KeyN => "KeyN",
+        Key::KeyO => "KeyO",
+        Key::KeyP => "KeyP",
+        Key::KeyQ => "KeyQ",
+        Key::KeyR => "KeyR",
+        Key::KeyS => "KeyS",
+        Key::KeyT => "KeyT",
+        Key::KeyU => "KeyU",
+        Key::KeyV => "KeyV",
+        Key::KeyW => "KeyW",
+        Key::KeyX => "KeyX",
+        Key::KeyY => "KeyY",
+        Key::KeyZ => "KeyZ",
+
+        Key::Num1 => "Digit1",
+        Key::Num2 => "Digit2",
+        Key::Num3 => "Digit3",
+        Key::Num4 => "Digit4",
+        Key::Num5 => "Digit5",
+        Key::Num6 => "Digit6",
+        Key::Num7 => "Digit7",
+        Key::Num8 => "Digit8",
+        Key::Num9 => "Digit9",
+        Key::Num0 => "Digit0",
+
+        Key::Space => "Space",
+        Key::Return => "Enter",
+        Key::Tab => "Tab",
+        Key::Escape => "Escape",
+        Key::Backspace => "Backspace",
+        Key::ShiftLeft => "ShiftLeft",
+        Key::ShiftRight => "ShiftRight",
+        Key::ControlLeft => "ControlLeft",
+        Key::ControlRight => "ControlRight",
+        Key::Alt => "AltLeft",
+        Key::AltGr => "AltRight",
+        Key::MetaLeft => "MetaLeft",
+        Key::MetaRight => "MetaRight",
+        Key::LeftArrow => "ArrowLeft",
+        Key::RightArrow => "ArrowRight",
+        Key::UpArrow => "ArrowUp",
+        Key::DownArrow => "ArrowDown",
+
+        Key::Minus => "Minus",
+        Key::Equal => "Equal",
+        Key::LeftBracket => "BracketLeft",
+        Key::RightBracket => "BracketRight",
+        Key::SemiColon => "Semicolon",
+        Key::Quote => "Quote",
+        Key::BackSlash => "Backslash",
+        Key::Comma => "Comma",
+        Key::Dot => "Period",
+        Key::Slash => "Slash",
+        Key::BackQuote => "Backquote",
+
+        Key::F1 => "F1",
+        Key::F2 => "F2",
+        Key::F3 => "F3",
+        Key::F4 => "F4",
+        Key::F5 => "F5",
+        Key::F6 => "F6",
+        Key::F7 => "F7",
+        Key::F8 => "F8",
+        Key::F9 => "F9",
+        Key::F10 => "F10",
+        Key::F11 => "F11",
+        Key::F12 => "F12",
+
+        Key::Home => "Home",
+        Key::End => "End",
+        Key::PageUp => "PageUp",
+        Key::PageDown => "PageDown",
+        Key::Delete => "Delete",
+        Key::Insert => "Insert",
+
+        _ => "Unknown",
+    }
+}
+
+#[cfg(target_os = "macos")]
 fn start_keyboard_listener(app: AppHandle, db_path: std::path::PathBuf) {
     use std::collections::HashSet;
     use std::sync::Arc;
@@ -226,9 +322,7 @@ fn start_keyboard_listener(app: AppHandle, db_path: std::path::PathBuf) {
         let flush_counter = Arc::new(std::sync::atomic::AtomicU32::new(0));
         let flush_b = flush_counter.clone();
 
-        // Track pressed modifier keys to distinguish press from release
-        let pressed_mods: Arc<Mutex<HashSet<u16>>> =
-            Arc::new(Mutex::new(HashSet::new()));
+        let pressed_mods: Arc<Mutex<HashSet<u16>>> = Arc::new(Mutex::new(HashSet::new()));
         let pressed_b = pressed_mods.clone();
 
         let block = RcBlock::new(move |event: std::ptr::NonNull<NSEvent>| {
@@ -242,10 +336,10 @@ fn start_keyboard_listener(app: AppHandle, db_path: std::path::PathBuf) {
                         let mut pressed = pressed_b.lock().unwrap();
                         if pressed.contains(&key_code) {
                             pressed.remove(&key_code);
-                            false // release
+                            false
                         } else {
                             pressed.insert(key_code);
-                            true // press
+                            true
                         }
                     }
                     _ => false,
@@ -266,7 +360,6 @@ fn start_keyboard_listener(app: AppHandle, db_path: std::path::PathBuf) {
             }
         });
 
-        // KeyDown = 1<<10, FlagsChanged = 1<<12
         let mask: u64 = (1u64 << 10) | (1u64 << 12);
         let _monitor: Option<objc2::rc::Retained<objc2::runtime::AnyObject>> = unsafe {
             objc2::msg_send_id![
@@ -276,12 +369,54 @@ fn start_keyboard_listener(app: AppHandle, db_path: std::path::PathBuf) {
             ]
         };
 
-        // Block this thread on its run loop so events are delivered
-        unsafe { NSRunLoop::currentRunLoop().run() };
+        unsafe { objc2_foundation::NSRunLoop::currentRunLoop().run() };
     });
 }
 
-// ── App entry ──────────────────────────────────────────────────────────────
+#[cfg(target_os = "windows")]
+fn start_keyboard_listener(app: AppHandle, db_path: std::path::PathBuf) {
+    use std::sync::Arc;
+
+    thread::spawn(move || {
+        use rdev::{listen, Event, EventType};
+
+        let conn = Arc::new(Mutex::new(
+            Connection::open(&db_path).expect("listener db open failed"),
+        ));
+        let conn_b = conn.clone();
+
+        let flush_counter = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let flush_b = flush_counter.clone();
+
+        let callback = move |event: Event| {
+            let key_name = match event.event_type {
+                EventType::KeyPress(key) => windows_key_to_name(key),
+                _ => return,
+            };
+
+            let count = KEYPRESS_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+            let _ = app.emit(
+                "key-press",
+                KeyPressPayload {
+                    count,
+                    key: key_name.to_string(),
+                },
+            );
+
+            let n = flush_b.fetch_add(1, Ordering::Relaxed) + 1;
+            if n % 20 == 0 {
+                save_today_count(&conn_b.lock().unwrap(), count);
+            }
+        };
+
+        if let Err(err) = listen(callback) {
+            eprintln!("windows keyboard listener failed: {:?}", err);
+        }
+    });
+}
+
+#[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
+fn start_keyboard_listener(_app: AppHandle, _db_path: std::path::PathBuf) {}
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -321,11 +456,8 @@ pub fn run() {
                         tauri_plugin_global_shortcut::Builder::new()
                             .with_handler(move |_app, triggered_shortcut, event| {
                                 if triggered_shortcut == &shortcut_for_handler {
-                                    match event.state() {
-                                        ShortcutState::Pressed => {
-                                            let _ = app_handle.emit("toggle-pass-through", ());
-                                        }
-                                        ShortcutState::Released => {}
+                                    if event.state() == ShortcutState::Pressed {
+                                        let _ = app_handle.emit("toggle-pass-through", ());
                                     }
                                 }
                             })
@@ -337,15 +469,51 @@ pub fn run() {
                     .register(shortcut)
                     .map_err(|e| e.to_string())?;
 
-                let debug_border_item = MenuItem::with_id(app, "debug_border", "🔲 显示窗口边框", true, None::<&str>)?;
-                let ai_item = MenuItem::with_id(app, "ai", "✨ what the dog doin?", true, None::<&str>)?;
-                let stats_item = MenuItem::with_id(app, "stats", "📊 详情统计", true, None::<&str>)?;
-                let passthrough_item = MenuItem::with_id(app, "passthrough", "🫥 切换穿透", true, None::<&str>)?;
+                let debug_border_item = MenuItem::with_id(
+                    app,
+                    "debug_border",
+                    "🔲 显示窗口边框",
+                    true,
+                    None::<&str>,
+                )?;
+                let ai_item = MenuItem::with_id(
+                    app,
+                    "ai",
+                    "✨ what the dog doin?",
+                    true,
+                    None::<&str>,
+                )?;
+                let stats_item = MenuItem::with_id(
+                    app,
+                    "stats",
+                    "📊 详情统计",
+                    true,
+                    None::<&str>,
+                )?;
+                let passthrough_item = MenuItem::with_id(
+                    app,
+                    "passthrough",
+                    "🫥 切换穿透",
+                    true,
+                    None::<&str>,
+                )?;
                 let sep = PredefinedMenuItem::separator(app)?;
-                let quit_item = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
+                let quit_item =
+                    MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
 
                 let sep2 = PredefinedMenuItem::separator(app)?;
-                let menu = Menu::with_items(app, &[&ai_item, &stats_item, &passthrough_item, &sep, &debug_border_item, &sep2, &quit_item])?;
+                let menu = Menu::with_items(
+                    app,
+                    &[
+                        &ai_item,
+                        &stats_item,
+                        &passthrough_item,
+                        &sep,
+                        &debug_border_item,
+                        &sep2,
+                        &quit_item,
+                    ],
+                )?;
 
                 TrayIconBuilder::new()
                     .icon(app.default_window_icon().unwrap().clone())
@@ -353,10 +521,18 @@ pub fn run() {
                     .show_menu_on_left_click(true)
                     .on_menu_event(|app, event| match event.id.as_ref() {
                         "quit" => app.exit(0),
-                        "ai" => { let _ = app.emit("tray-ai-analysis", ()); }
-                        "stats" => { let _ = app.emit("tray-open-stats", ()); }
-                        "passthrough" => { let _ = app.emit("toggle-pass-through", ()); }
-                        "debug_border" => { let _ = app.emit("toggle-debug-border", ()); }
+                        "ai" => {
+                            let _ = app.emit("tray-ai-analysis", ());
+                        }
+                        "stats" => {
+                            let _ = app.emit("tray-open-stats", ());
+                        }
+                        "passthrough" => {
+                            let _ = app.emit("toggle-pass-through", ());
+                        }
+                        "debug_border" => {
+                            let _ = app.emit("toggle-debug-border", ());
+                        }
                         _ => {}
                     })
                     .build(app)?;

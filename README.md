@@ -45,7 +45,7 @@ Built at **UNIHACK 2026** in 48 hours.
 
 - [Node.js](https://nodejs.org) ≥ 18
 - [Rust](https://rustup.rs) (stable)
-- macOS 12+
+- macOS 12+ (arm64 only)
 
 ### Run in development
 

@@ -13,7 +13,7 @@
         class="dog-container"
         :class="{ dragging: isDragging }"
         @mousedown.left="onDogMouseDown"
-        :title="passThroughEnabled ? '当前是穿透模式，按 Ctrl+Shift+D 恢复交互' : '按住可以拖动'"
+        :title="passThroughEnabled ? t.passThroughDragHint : t.dragHint"
       >
         <!-- 底层：没手的狗 + 键盘，始终显示 -->
         <img class="dog-sprite layer-base"
@@ -57,48 +57,62 @@
         <button class="close-btn panel-close" @click="closePanel">×</button>
 
         <div class="panel-header">
-          <h3>📊 本周战绩</h3>
-          <button class="panel-mode-btn" @click="enablePassThrough">
-            开启穿透
-          </button>
-        </div>
-
-        <div class="week-chart">
-          <div
-            v-for="day in weekStats"
-            :key="day.date"
-            class="bar-col"
-          >
-            <div class="bar-wrap">
-              <div
-                class="bar"
-                :style="{ height: barHeight(day.keys) + 'px' }"
-                :class="{ today: isToday(day.date) }"
-              ></div>
-            </div>
-            <div class="bar-label">{{ shortDate(day.date) }}</div>
+          <div class="tab-row">
+            <button :class="['tab-btn', { active: activeTab === 'week' }]" @click="activeTab = 'week'">{{ t.weekTab }}</button>
+            <button :class="['tab-btn', { active: activeTab === 'today' }]" @click="activeTab = 'today'">{{ t.todayTab }}</button>
           </div>
+          <button class="panel-mode-btn" @click="enablePassThrough">{{ t.passthroughBtn }}</button>
         </div>
 
-        <div class="week-total">
-          总计 {{ weekTotal.toLocaleString() }} 次击键
-        </div>
+        <!-- 本周 tab -->
+        <template v-if="activeTab === 'week'">
+          <div class="week-chart">
+            <div v-for="day in weekStats" :key="day.date" class="bar-col">
+              <div class="bar-wrap">
+                <div class="bar" :style="{ height: barHeight(day.keys) + 'px' }" :class="{ today: isToday(day.date) }"></div>
+              </div>
+              <div class="bar-label">{{ shortDate(day.date) }}</div>
+            </div>
+          </div>
+          <div class="week-total">{{ t.weekTotal(weekTotal) }}</div>
+        </template>
 
-        <div class="api-section">
-          <input
-            v-model="apiKey"
-            type="password"
-            placeholder="Claude API Key（可选）"
-            class="api-input"
-            @change="saveApiKey"
-          />
-        </div>
+        <!-- 今日 tab -->
+        <template v-else>
+          <div class="today-scroll">
+            <!-- WPM 图表 -->
+            <div class="section-title">{{ t.wpmTitle }}</div>
+            <div v-if="wpmHistory.length === 0" class="no-data">{{ t.noData }}</div>
+            <div v-else class="wpm-chart">
+              <div v-for="h in wpmHistory" :key="h.hour" class="bar-col">
+                <div class="bar-wrap" style="height:48px">
+                  <div class="bar today" :style="{ height: wpmBarHeight(h.wpm) + 'px' }"></div>
+                </div>
+                <div class="bar-label">{{ t.hourLabel(h.hour) }}</div>
+              </div>
+            </div>
+
+            <!-- 按键频率 -->
+            <div class="section-title" style="margin-top:10px">{{ t.keyFreqTitle }}</div>
+            <div v-if="keyStats.length === 0" class="no-data">{{ t.noData }}</div>
+            <div v-else class="key-stats">
+              <div v-for="item in keyStats" :key="item.key" class="key-stat-row">
+                <span class="key-label">{{ keyDisplayName(item.key) }}</span>
+                <div class="key-bar-wrap">
+                  <div class="key-bar" :style="{ width: (item.count / keyStats[0].count * 100) + '%' }"></div>
+                </div>
+                <span class="key-count">{{ item.count }}</span>
+              </div>
+            </div>
+          </div>
+        </template>
+
       </div>
     </Transition>
 
     <Transition name="fade">
       <div v-if="showPassthroughHint" class="passthrough-hint">
-        已开启穿透（Ctrl+Shift+D 恢复）
+        {{ t.passthroughHint }}
       </div>
     </Transition>
 
@@ -106,10 +120,10 @@
     <Transition name="fade">
       <div v-if="showAccessibilityAlert" class="accessibility-alert" @mousedown.stop>
         <div class="ax-icon">⌨️</div>
-        <div class="ax-title">需要「输入监控」权限</div>
-        <div class="ax-desc">系统设置 → 隐私与安全性 → 输入监控，添加本应用后重启</div>
-        <button class="ax-btn" @click="openAccessibilitySettings">去授权</button>
-        <button class="ax-dismiss" @click="showAccessibilityAlert = false">稍后</button>
+        <div class="ax-title">{{ t.axTitle }}</div>
+        <div class="ax-desc">{{ t.axDesc }}</div>
+        <button class="ax-btn" @click="openAccessibilitySettings">{{ t.axBtn }}</button>
+        <button class="ax-dismiss" @click="showAccessibilityAlert = false">{{ t.axDismiss }}</button>
       </div>
     </Transition>
   </div>
@@ -121,7 +135,39 @@ import { listen } from '@tauri-apps/api/event'
 import { invoke } from '@tauri-apps/api/core'
 import { getCurrentWindow } from '@tauri-apps/api/window'
 
+// ── 按键音效 ──────────────────────────────────────────────────────────────────
+const audioCtx = new AudioContext()
+const clickBuffers: AudioBuffer[] = []
+const soundEnabled = ref(true)
+
+async function loadClickSounds() {
+  const urls = [
+    new URL('./assets/sounds/click1.mp3', import.meta.url).href,
+    new URL('./assets/sounds/click2.mp3', import.meta.url).href,
+    new URL('./assets/sounds/click3.mp3', import.meta.url).href,
+    new URL('./assets/sounds/click4.mp3', import.meta.url).href,
+    new URL('./assets/sounds/click5.mp3', import.meta.url).href,
+  ]
+  for (const url of urls) {
+    const resp = await fetch(url)
+    const buf = await resp.arrayBuffer()
+    clickBuffers.push(await audioCtx.decodeAudioData(buf))
+  }
+}
+
+function playClick() {
+  if (!soundEnabled.value || clickBuffers.length === 0) return
+  const buf = clickBuffers[Math.floor(Math.random() * clickBuffers.length)]
+  const src = audioCtx.createBufferSource()
+  src.buffer = buf
+  src.connect(audioCtx.destination)
+  src.start()
+}
+// ─────────────────────────────────────────────────────────────────────────────
+
 type WeekStat = { date: string; keys: number }
+type KeyStat = { key: string; count: number }
+type WpmPoint = { hour: string; wpm: number; keys: number }
 type KeyPressPayload = { count: number; key: string }
 
 // Maps Rust key names → actual sprite filenames (without .png)
@@ -165,6 +211,9 @@ function keySpriteSrc(code: string): string {
 const todayCount = ref(0)
 const recentKeys = ref<number[]>([])
 const showPanel = ref(false)
+const activeTab = ref<'week' | 'today'>('week')
+const keyStats = ref<KeyStat[]>([])
+const wpmHistory = ref<WpmPoint[]>([])
 const aiAnalysis = ref('')
 const isLoading = ref(false)
 const apiKey = ref(localStorage.getItem('claude_api_key') ?? '')
@@ -186,6 +235,46 @@ let unlistenTogglePassThrough: (() => void) | null = null
 let unlistenTrayAI: (() => void) | null = null
 let unlistenTrayStats: (() => void) | null = null
 
+
+const lang = ref(localStorage.getItem('lang') ?? 'zh') // will be synced from Rust on mount
+
+const t = computed(() => {
+  const zh = {
+    dragHint: '拖动我',
+    passThroughDragHint: '穿透模式：无法拖动',
+    weekTab: '本周',
+    todayTab: '今日',
+    passthroughBtn: '🖱 穿透模式',
+    weekTotal: (n: number) => `本周共击键 ${n} 次`,
+    wpmTitle: '打字速度 (WPM)',
+    noData: '今日暂无数据',
+    hourLabel: (h: string) => h,
+    keyFreqTitle: '按键频率',
+    passthroughHint: '已开启穿透（Ctrl+Shift+D 恢复）',
+    axTitle: '需要「输入监控」权限',
+    axDesc: '系统设置 → 隐私与安全性 → 输入监控，添加本应用后重启',
+    axBtn: '去授权',
+    axDismiss: '稍后',
+  }
+  const en = {
+    dragHint: 'Drag me',
+    passThroughDragHint: 'Pass-through: cannot drag',
+    weekTab: 'Week',
+    todayTab: 'Today',
+    passthroughBtn: '🖱 Pass-through',
+    weekTotal: (n: number) => `${n} keystrokes this week`,
+    wpmTitle: 'Typing Speed (WPM)',
+    noData: 'No data yet today',
+    hourLabel: (h: string) => h,
+    keyFreqTitle: 'Key Frequency',
+    passthroughHint: 'Pass-through enabled (Ctrl+Shift+D to exit)',
+    axTitle: 'Input Monitoring Required',
+    axDesc: 'System Settings → Privacy & Security → Input Monitoring, add this app then restart',
+    axBtn: 'Authorize',
+    axDismiss: 'Later',
+  }
+  return lang.value === 'en' ? en : zh
+})
 
 const currentWPM = computed(() => {
   const now = Date.now()
@@ -249,6 +338,7 @@ async function togglePassThrough() {
 }
 
 function onKeyPress(count: number, key: string) {
+  playClick()
   todayCount.value = count
   const next = new Set(activeKeys.value)
   next.add(key)
@@ -276,23 +366,61 @@ async function getAIAnalysis() {
       totalKeys: todayCount.value,
       wpm: currentWPM.value,
       apiKey: apiKey.value,
+      lang: lang.value,
     })
     aiAnalysis.value = result
   } catch (err) {
     console.error(err)
-    aiAnalysis.value = `今天打了 ${todayCount.value} 下，Yamper 觉得你棒棒的 🐾`
+    aiAnalysis.value = lang.value === 'en'
+      ? `${todayCount.value} keystrokes today — Yamper thinks you're awesome 🐾`
+      : `今天打了 ${todayCount.value} 下，Yamper 觉得你棒棒的 🐾`
   } finally {
     isLoading.value = false
     await syncWindowMode()
   }
 }
 
-function saveApiKey() {
-  localStorage.setItem('claude_api_key', apiKey.value)
-}
 
 function barHeight(keys: number): number {
   return Math.round((keys / maxKeys.value) * 60)
+}
+
+const maxWpm = computed(() => Math.max(...wpmHistory.value.map(h => h.wpm), 1))
+
+function wpmBarHeight(wpm: number): number {
+  return Math.round((wpm / maxWpm.value) * 48)
+}
+
+function keyDisplayName(key: string): string {
+  if (key.startsWith('Key')) return key.slice(3)
+  if (key.startsWith('Digit')) return key.slice(5)
+  const map: Record<string, string> = {
+    Space: '␣', Return: '↵', Backspace: '⌫', Tab: '⇥',
+    Escape: 'Esc', Delete: 'Del',
+    ShiftLeft: '⇧L', ShiftRight: '⇧R',
+    MetaLeft: '⌘L', MetaRight: '⌘R',
+    Alt: '⌥L', AltRight: '⌥R',
+    ControlLeft: '⌃L', ControlRight: '⌃R',
+    CapsLock: '⇪', Fn: 'Fn',
+    ArrowLeft: '←', ArrowRight: '→', ArrowUp: '↑', ArrowDown: '↓',
+    Comma: ',', Period: '.', Slash: '/', Backslash: '\\',
+    Minus: '-', Equal: '=', BracketLeft: '[', BracketRight: ']',
+    Quote: "'", Backquote: '`', Semicolon: ';',
+  }
+  return map[key] ?? key
+}
+
+async function loadTodayStats() {
+  try {
+    const [ks, wpm] = await Promise.all([
+      invoke<KeyStat[]>('get_key_stats'),
+      invoke<WpmPoint[]>('get_wpm_history'),
+    ])
+    keyStats.value = ks
+    wpmHistory.value = wpm
+  } catch (err) {
+    console.error('loadTodayStats failed:', err)
+  }
 }
 
 function isToday(date: string): boolean {
@@ -339,7 +467,7 @@ async function onDogMouseDown(e: MouseEvent) {
 async function openPanel() {
   await disablePassThrough()
   showPanel.value = true
-  await loadWeekStats()
+  await Promise.all([loadWeekStats(), loadTodayStats()])
 }
 
 async function closePanel() {
@@ -370,6 +498,22 @@ watch(passThroughEnabled, async () => {
 })
 
 onMounted(async () => {
+  loadClickSounds().catch(console.error)
+
+  try {
+    soundEnabled.value = await invoke<boolean>('get_sound')
+  } catch (err) {
+    console.error('get_sound failed:', err)
+  }
+
+  try {
+    const savedLang = await invoke<string>('get_language')
+    lang.value = savedLang
+    localStorage.setItem('lang', savedLang)
+  } catch (err) {
+    console.error('get_language failed:', err)
+  }
+
   try {
     const trusted = await invoke<boolean>('check_accessibility')
     if (!trusted) showAccessibilityAlert.value = true
@@ -398,6 +542,13 @@ onMounted(async () => {
     unlistenTrayAI = await listen('tray-ai-analysis', () => getAIAnalysis())
     unlistenTrayStats = await listen('tray-open-stats', () => openPanel())
     await listen('toggle-debug-border', () => { showDebugBorder.value = !showDebugBorder.value })
+    await listen<string>('set-language', (e) => {
+      lang.value = e.payload
+      localStorage.setItem('lang', e.payload)
+    })
+    await listen<boolean>('set-sound', (e) => {
+      soundEnabled.value = e.payload
+    })
   } catch (err) {
     console.error('listen failed:', err)
   }
@@ -581,7 +732,7 @@ body {
   align-items: center;
   justify-content: space-between;
   gap: 8px;
-  margin-right: 18px;
+  margin-right: 20px;
 }
 
 .stats-panel h3 {
@@ -636,28 +787,122 @@ body {
   text-align: center;
 }
 
-.api-section {
-  margin-top: auto;
+.tab-row {
+  display: flex;
+  gap: 4px;
 }
 
-.api-input {
-  width: 100%;
+.tab-btn {
+  flex: 1;
   background: rgba(255, 255, 255, 0.07);
-  border: 1px solid rgba(255, 255, 255, 0.12);
-  border-radius: 8px;
-  padding: 6px 10px;
-  color: #ccc;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 6px;
+  color: #888;
+  cursor: pointer;
   font-size: 11px;
-  outline: none;
+  font-weight: 600;
+  padding: 4px 0;
+  transition: all 0.15s;
 }
 
-.api-input::placeholder {
-  color: #555;
-}
-
-.api-input:focus {
+.tab-btn.active {
+  background: rgba(167, 139, 250, 0.25);
   border-color: rgba(167, 139, 250, 0.5);
+  color: #c4b5fd;
 }
+
+.today-scroll {
+  flex: 1;
+  overflow-y: auto;
+  min-height: 0;
+}
+
+.today-scroll::-webkit-scrollbar {
+  width: 3px;
+}
+
+.today-scroll::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.15);
+  border-radius: 2px;
+}
+
+.section-title {
+  color: #999;
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  margin-bottom: 6px;
+}
+
+.no-data {
+  color: #555;
+  font-size: 11px;
+  text-align: center;
+  padding: 8px 0;
+}
+
+.wpm-chart {
+  display: flex;
+  align-items: flex-end;
+  gap: 3px;
+  margin-bottom: 4px;
+}
+
+.wpm-chart .bar-col {
+  flex: 1;
+  min-width: 0;
+}
+
+.wpm-chart .bar-label {
+  font-size: 9px;
+}
+
+.key-stats {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.key-stat-row {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.key-label {
+  color: #bbb;
+  font-size: 10px;
+  font-family: monospace;
+  width: 28px;
+  flex-shrink: 0;
+  text-align: right;
+}
+
+.key-bar-wrap {
+  flex: 1;
+  height: 8px;
+  background: rgba(255, 255, 255, 0.06);
+  border-radius: 2px;
+  overflow: hidden;
+}
+
+.key-bar {
+  height: 100%;
+  background: linear-gradient(to right, #a78bfa, #60a5fa);
+  border-radius: 2px;
+  min-width: 2px;
+  transition: width 0.3s ease;
+}
+
+.key-count {
+  color: #666;
+  font-size: 9px;
+  width: 32px;
+  flex-shrink: 0;
+  text-align: right;
+}
+
 
 .passthrough-hint {
   position: absolute;

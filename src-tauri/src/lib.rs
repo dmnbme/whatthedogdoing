@@ -5,7 +5,7 @@ use std::thread;
 
 use chrono::Local;
 use rusqlite::{params, Connection};
-use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
+use tauri::menu::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem, Submenu};
 use tauri::tray::TrayIconBuilder;
 use tauri::{AppHandle, Emitter, Manager, State};
 use tauri_plugin_global_shortcut::{
@@ -47,6 +47,7 @@ extern "C" {
     ) -> *mut std::ffi::c_void;
     fn CGEventTapEnable(tap: *mut std::ffi::c_void, enable: bool);
     fn CGEventGetIntegerValueField(event: *mut std::ffi::c_void, field: i32) -> i64;
+    fn CGEventGetFlags(event: *mut std::ffi::c_void) -> u64;
 }
 
 #[cfg(target_os = "macos")]
@@ -92,9 +93,64 @@ fn init_db(conn: &Connection) {
             ended_at TEXT,
             key_count INTEGER NOT NULL DEFAULT 0
         );
+
+        CREATE TABLE IF NOT EXISTS keystrokes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            pressed_at TEXT NOT NULL,
+            key TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_keystrokes_date
+            ON keystrokes (date(pressed_at));
         "#,
     )
     .expect("failed to init db");
+}
+
+fn read_lang(data_dir: &std::path::Path) -> String {
+    let s = std::fs::read_to_string(data_dir.join("lang.txt")).unwrap_or_default();
+    let s = s.trim();
+    if s == "en" { "en".to_string() } else { "zh".to_string() }
+}
+
+fn write_lang(data_dir: &std::path::Path, lang: &str) {
+    let _ = std::fs::write(data_dir.join("lang.txt"), lang);
+}
+
+fn read_sound(data_dir: &std::path::Path) -> bool {
+    let s = std::fs::read_to_string(data_dir.join("sound.txt")).unwrap_or_default();
+    s.trim() != "off"
+}
+
+fn write_sound(data_dir: &std::path::Path, on: bool) {
+    let _ = std::fs::write(data_dir.join("sound.txt"), if on { "on" } else { "off" });
+}
+
+fn build_tray_menu(app: &AppHandle, lang: &str, sound_on: bool) -> tauri::Result<Menu<tauri::Wry>> {
+    let ai_item = MenuItem::with_id(app, "ai", "✨ what the dog doin?", true, None::<&str>)?;
+    let stats_item = MenuItem::with_id(app, "stats", "📊 Stats", true, None::<&str>)?;
+    let passthrough_item = MenuItem::with_id(app, "passthrough", "🫥 Passthrough", true, None::<&str>)?;
+    let sound_item = CheckMenuItem::with_id(app, "sound", "🔊 Sound", true, sound_on, None::<&str>)?;
+    let sep = PredefinedMenuItem::separator(app)?;
+    let lang_zh = CheckMenuItem::with_id(app, "lang_zh", "中文", true, lang == "zh", None::<&str>)?;
+    let lang_en = CheckMenuItem::with_id(app, "lang_en", "English", true, lang == "en", None::<&str>)?;
+    let lang_menu = Submenu::with_items(app, "🌐 Language", true, &[&lang_zh, &lang_en])?;
+    let debug_border_item = MenuItem::with_id(app, "debug_border", "🔲 Debug border", true, None::<&str>)?;
+    let sep2 = PredefinedMenuItem::separator(app)?;
+    let quit_item = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
+    Menu::with_items(app, &[&ai_item, &stats_item, &passthrough_item, &sound_item, &sep, &lang_menu, &debug_border_item, &sep2, &quit_item])
+}
+
+#[tauri::command]
+fn get_language(app: AppHandle) -> String {
+    let data_dir = app.path().app_data_dir().unwrap_or_default();
+    read_lang(&data_dir)
+}
+
+#[tauri::command]
+fn get_sound(app: AppHandle) -> bool {
+    let data_dir = app.path().app_data_dir().unwrap_or_default();
+    read_sound(&data_dir)
 }
 
 fn load_today_count(conn: &Connection) -> u64 {
@@ -190,6 +246,81 @@ fn get_weekly_stats(db: State<Db>) -> Vec<serde_json::Value> {
 }
 
 #[tauri::command]
+fn get_keystrokes(db: State<Db>, date: Option<String>) -> Vec<serde_json::Value> {
+    let conn = db.0.lock().unwrap();
+    let day = date.unwrap_or_else(|| Local::now().format("%Y-%m-%d").to_string());
+    let mut stmt = conn
+        .prepare(
+            "SELECT pressed_at, key FROM keystrokes
+             WHERE date(pressed_at) = ?1
+             ORDER BY pressed_at ASC",
+        )
+        .unwrap();
+    stmt.query_map(params![day], |row| {
+        Ok(serde_json::json!({
+            "time": row.get::<_, String>(0)?,
+            "key":  row.get::<_, String>(1)?,
+        }))
+    })
+    .unwrap()
+    .filter_map(|r| r.ok())
+    .collect()
+}
+
+#[tauri::command]
+fn get_key_stats(db: State<Db>, date: Option<String>) -> Vec<serde_json::Value> {
+    let conn = db.0.lock().unwrap();
+    let day = date.unwrap_or_else(|| Local::now().format("%Y-%m-%d").to_string());
+    let mut stmt = conn
+        .prepare(
+            "SELECT key, COUNT(*) as cnt FROM keystrokes
+             WHERE date(pressed_at) = ?1
+             GROUP BY key ORDER BY cnt DESC LIMIT 30",
+        )
+        .unwrap();
+    stmt.query_map(params![day], |row| {
+        Ok(serde_json::json!({
+            "key":   row.get::<_, String>(0)?,
+            "count": row.get::<_, i64>(1)?,
+        }))
+    })
+    .unwrap()
+    .filter_map(|r| r.ok())
+    .collect()
+}
+
+#[tauri::command]
+fn get_wpm_history(db: State<Db>, date: Option<String>) -> Vec<serde_json::Value> {
+    let conn = db.0.lock().unwrap();
+    let day = date.unwrap_or_else(|| Local::now().format("%Y-%m-%d").to_string());
+    // Group by hour; use distinct active minutes as denominator for WPM estimate
+    let mut stmt = conn
+        .prepare(
+            "SELECT strftime('%H', pressed_at) as hour,
+                    COUNT(*) as keys,
+                    COUNT(DISTINCT strftime('%H:%M', pressed_at)) as active_minutes
+             FROM keystrokes
+             WHERE date(pressed_at) = ?1
+             GROUP BY strftime('%H', pressed_at)
+             ORDER BY hour ASC",
+        )
+        .unwrap();
+    stmt.query_map(params![day], |row| {
+        let keys: i64 = row.get(1)?;
+        let active_min: i64 = row.get(2)?;
+        let wpm = if active_min > 0 { keys / 5 / active_min } else { 0 };
+        Ok(serde_json::json!({
+            "hour":  row.get::<_, String>(0)?,
+            "wpm":   wpm,
+            "keys":  keys,
+        }))
+    })
+    .unwrap()
+    .filter_map(|r| r.ok())
+    .collect()
+}
+
+#[tauri::command]
 async fn set_window_ignore_cursor(app: AppHandle, ignore: bool) -> Result<(), String> {
     let window = app
         .get_webview_window("main")
@@ -200,18 +331,28 @@ async fn set_window_ignore_cursor(app: AppHandle, ignore: bool) -> Result<(), St
 }
 
 #[tauri::command]
-async fn analyze_typing(total_keys: u64, wpm: u32, api_key: String) -> Result<String, String> {
+async fn analyze_typing(total_keys: u64, wpm: u32, api_key: String, lang: String) -> Result<String, String> {
     if api_key.trim().is_empty() {
-        return Ok(fun_fallback(total_keys, wpm));
+        return Ok(fun_fallback(total_keys, wpm, &lang));
     }
     let client = reqwest::Client::new();
-    let prompt = format!(
-        "用户今天的打字数据：总击键 {} 次，当前 WPM {}。\
-         用 1-2 句话、轻松幽默的口吻（中文）分析他的打字状态，\
-         并给他一个有趣的「打字人设」标签，比如「凌晨码字侠」「爆发型选手」。\
-         回复控制在 50 字以内。",
-        total_keys, wpm
-    );
+    let prompt = if lang == "en" {
+        format!(
+            "User's typing stats today: {} total keystrokes, current WPM {}. \
+             In 1-2 sentences, give a fun and light-hearted analysis of their typing style, \
+             and assign them an interesting typist persona tag like 'Midnight Coder' or 'Burst Typer'. \
+             Keep it under 50 words.",
+            total_keys, wpm
+        )
+    } else {
+        format!(
+            "用户今天的打字数据：总击键 {} 次，当前 WPM {}。\
+             用 1-2 句话、轻松幽默的口吻（中文）分析他的打字状态，\
+             并给他一个有趣的「打字人设」标签，比如「凌晨码字侠」「爆发型选手」。\
+             回复控制在 50 字以内。",
+            total_keys, wpm
+        )
+    };
     let body = serde_json::json!({
         "model": "claude-haiku-4-5-20251001",
         "max_tokens": 150,
@@ -227,24 +368,28 @@ async fn analyze_typing(total_keys: u64, wpm: u32, api_key: String) -> Result<St
         .await
         .map_err(|e| e.to_string())?;
     let json: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
+    let fallback = if lang == "en" { "Yamper is proud of you today 🐾" } else { "Yamper 今天也很努力 🐾" };
     let text = json["content"][0]["text"]
         .as_str()
-        .unwrap_or("Yamper 今天也很努力 🐾")
+        .unwrap_or(fallback)
         .to_string();
     Ok(text)
 }
 
-fn fun_fallback(total_keys: u64, wpm: u32) -> String {
-    let label = if wpm > 80 {
-        "「爆发型选手」"
-    } else if wpm > 50 {
-        "「稳健码字侠」"
-    } else if total_keys > 5000 {
-        "「耐力型选手」"
+fn fun_fallback(total_keys: u64, wpm: u32, lang: &str) -> String {
+    if lang == "en" {
+        let label = if wpm > 80 { "Burst Typer" }
+            else if wpm > 50 { "Steady Coder" }
+            else if total_keys > 5000 { "Endurance Typist" }
+            else { "Professional Slacker" };
+        format!("{} keystrokes today, {} WPM — you've been certified as: {} ⚡", total_keys, wpm, label)
     } else {
-        "「摸鱼预备役」"
-    };
-    format!("今天打了 {} 下，{} WPM，人设认定：{} ⚡", total_keys, wpm, label)
+        let label = if wpm > 80 { "「爆发型选手」" }
+            else if wpm > 50 { "「稳健码字侠」" }
+            else if total_keys > 5000 { "「耐力型选手」" }
+            else { "「摸鱼预备役」" };
+        format!("今天打了 {} 下，{} WPM，人设认定：{} ⚡", total_keys, wpm, label)
+    }
 }
 
 // ── Keycode mapping ─────────────────────────────────────────────────────────
@@ -293,6 +438,11 @@ unsafe extern "C" fn cg_event_callback(
 
     eprintln!("[kbd] event_type={} keycode={} key={}", event_type, key_code, key_name);
 
+    // Skip unmapped keys (e.g. keycode=255 fired alongside CapsLock events)
+    if key_name == "Unknown" {
+        return event;
+    }
+
     let app = match GLOBAL_APP.get() {
         Some(a) => a,
         None => return event,
@@ -302,10 +452,15 @@ unsafe extern "C" fn cg_event_callback(
         10 => {
             // kCGEventKeyDown — emit press; release comes from KeyUp (event 11)
             let count = KEYPRESS_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
-            let _ = app.emit("key-press", KeyPressPayload { count, key: key_name });
-            if count % 20 == 0 {
-                if let Some(conn_mutex) = GLOBAL_DB_CONN.get() {
-                    if let Ok(conn) = conn_mutex.try_lock() {
+            let _ = app.emit("key-press", KeyPressPayload { count, key: key_name.clone() });
+            if let Some(conn_mutex) = GLOBAL_DB_CONN.get() {
+                if let Ok(conn) = conn_mutex.try_lock() {
+                    let now = Local::now().format("%Y-%m-%dT%H:%M:%S").to_string();
+                    let _ = conn.execute(
+                        "INSERT INTO keystrokes (pressed_at, key) VALUES (?1, ?2)",
+                        params![now, &key_name],
+                    );
+                    if count % 20 == 0 {
                         save_today_count(&conn, count);
                     }
                 }
@@ -318,22 +473,23 @@ unsafe extern "C" fn cg_event_callback(
         12 => {
             // kCGEventFlagsChanged — modifier keys
             if key_code == 57 {
-                // CapsLock: macOS FlagsChanged fires on both press and release, but release
-                // detection is unreliable across OS versions. Match BongoCat's approach:
-                // treat every FlagsChanged as a tap — press immediately, auto-release after
-                // 150 ms. The gen counter debounces rapid events (press+release pair) so
-                // only the LAST timer fires, preventing a stuck "no hand" state.
+                // CapsLock: on every physical key-down (alpha=true), show the sprite for 400ms.
+                // A gen counter ensures rapid presses only produce one 400ms window.
                 static CAPS_GEN: AtomicU64 = AtomicU64::new(0);
-                let gen = CAPS_GEN.fetch_add(1, Ordering::Relaxed) + 1;
-                let count = KEYPRESS_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
-                let _ = app.emit("key-press", KeyPressPayload { count, key: key_name.clone() });
-                let app_rel = app.clone();
-                thread::spawn(move || {
-                    thread::sleep(std::time::Duration::from_millis(150));
-                    if CAPS_GEN.load(Ordering::Relaxed) == gen {
-                        let _ = app_rel.emit("key-release", key_name);
-                    }
-                });
+                let flags = CGEventGetFlags(event);
+                let alpha_now = (flags & 0x10000) != 0;
+                if alpha_now {
+                    let gen = CAPS_GEN.fetch_add(1, Ordering::Relaxed) + 1;
+                    let count = KEYPRESS_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+                    let _ = app.emit("key-press", KeyPressPayload { count, key: key_name.clone() });
+                    let app_rel = app.clone();
+                    thread::spawn(move || {
+                        thread::sleep(std::time::Duration::from_millis(200));
+                        if CAPS_GEN.load(Ordering::Relaxed) == gen {
+                            let _ = app_rel.emit("key-release", key_name);
+                        }
+                    });
+                }
             } else {
                 // Other modifier keys: FlagsChanged fires on press AND release,
                 // so toggle in/out of pressed set to track state.
@@ -415,8 +571,13 @@ pub fn run() {
             get_keypress_count,
             reset_keypress_count,
             get_weekly_stats,
+            get_keystrokes,
+            get_key_stats,
+            get_wpm_history,
             set_window_ignore_cursor,
             analyze_typing,
+            get_language,
+            get_sound,
         ])
         .setup(|app| {
             let data_dir = app.path().app_data_dir().unwrap();
@@ -461,27 +622,58 @@ pub fn run() {
                     .register(shortcut)
                     .map_err(|e| e.to_string())?;
 
-                let debug_border_item = MenuItem::with_id(app, "debug_border", "🔲 显示窗口边框", true, None::<&str>)?;
-                let ai_item = MenuItem::with_id(app, "ai", "✨ what the dog doin?", true, None::<&str>)?;
-                let stats_item = MenuItem::with_id(app, "stats", "📊 详情统计", true, None::<&str>)?;
-                let passthrough_item = MenuItem::with_id(app, "passthrough", "🫥 切换穿透", true, None::<&str>)?;
-                let sep = PredefinedMenuItem::separator(app)?;
-                let quit_item = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
+                let initial_lang = read_lang(&data_dir);
+                let initial_sound = read_sound(&data_dir);
+                let menu = build_tray_menu(app.handle(), &initial_lang, initial_sound)?;
 
-                let sep2 = PredefinedMenuItem::separator(app)?;
-                let menu = Menu::with_items(app, &[&ai_item, &stats_item, &passthrough_item, &sep, &debug_border_item, &sep2, &quit_item])?;
-
-                TrayIconBuilder::new()
-                    .icon(app.default_window_icon().unwrap().clone())
+                TrayIconBuilder::with_id("main")
+                    .icon(tauri::include_image!("icons/icon/tray.png"))
                     .menu(&menu)
                     .show_menu_on_left_click(true)
-                    .on_menu_event(|app, event| match event.id.as_ref() {
-                        "quit" => app.exit(0),
-                        "ai" => { let _ = app.emit("tray-ai-analysis", ()); }
-                        "stats" => { let _ = app.emit("tray-open-stats", ()); }
-                        "passthrough" => { let _ = app.emit("toggle-pass-through", ()); }
-                        "debug_border" => { let _ = app.emit("toggle-debug-border", ()); }
-                        _ => {}
+                    .on_menu_event(|app, event| {
+                        let data_dir = match app.path().app_data_dir() {
+                            Ok(d) => d,
+                            Err(_) => return,
+                        };
+                        match event.id.as_ref() {
+                            "quit" => app.exit(0),
+                            "ai" => { let _ = app.emit("tray-ai-analysis", ()); }
+                            "stats" => { let _ = app.emit("tray-open-stats", ()); }
+                            "passthrough" => { let _ = app.emit("toggle-pass-through", ()); }
+                            "debug_border" => { let _ = app.emit("toggle-debug-border", ()); }
+                            "sound" => {
+                                let new_val = !read_sound(&data_dir);
+                                write_sound(&data_dir, new_val);
+                                let _ = app.emit("set-sound", new_val);
+                                let lang = read_lang(&data_dir);
+                                if let Some(tray) = app.tray_by_id("main") {
+                                    if let Ok(m) = build_tray_menu(app, &lang, new_val) {
+                                        let _ = tray.set_menu(Some(m));
+                                    }
+                                }
+                            }
+                            "lang_zh" => {
+                                write_lang(&data_dir, "zh");
+                                let _ = app.emit("set-language", "zh");
+                                if let Some(tray) = app.tray_by_id("main") {
+                                    let sound = read_sound(&data_dir);
+                                    if let Ok(m) = build_tray_menu(app, "zh", sound) {
+                                        let _ = tray.set_menu(Some(m));
+                                    }
+                                }
+                            }
+                            "lang_en" => {
+                                write_lang(&data_dir, "en");
+                                let _ = app.emit("set-language", "en");
+                                if let Some(tray) = app.tray_by_id("main") {
+                                    let sound = read_sound(&data_dir);
+                                    if let Ok(m) = build_tray_menu(app, "en", sound) {
+                                        let _ = tray.set_menu(Some(m));
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
                     })
                     .build(app)?;
             }

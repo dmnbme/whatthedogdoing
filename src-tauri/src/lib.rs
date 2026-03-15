@@ -1,5 +1,6 @@
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 use std::thread;
 
 use chrono::Local;
@@ -13,6 +14,61 @@ use tauri_plugin_global_shortcut::{
 
 static KEYPRESS_COUNT: AtomicU64 = AtomicU64::new(0);
 
+// ── Global state for CGEventTap C callback ───────────────────────────────────
+
+static GLOBAL_APP: OnceLock<AppHandle> = OnceLock::new();
+static GLOBAL_DB_CONN: OnceLock<Mutex<Connection>> = OnceLock::new();
+static GLOBAL_PRESSED_MODS: OnceLock<Mutex<HashSet<u16>>> = OnceLock::new();
+
+// ── macOS framework bindings ────────────────────────────────────────────────
+
+#[cfg(target_os = "macos")]
+#[link(name = "IOKit", kind = "framework")]
+extern "C" {
+    fn IOHIDCheckAccess(request_type: u32) -> u32; // 0=granted, 1=denied, 2=unknown
+    fn IOHIDRequestAccess(request_type: u32) -> bool;
+}
+
+#[cfg(target_os = "macos")]
+#[link(name = "CoreGraphics", kind = "framework")]
+extern "C" {
+    fn CGEventTapCreate(
+        tap: u32,
+        place: u32,
+        options: u32,
+        events_of_interest: u64,
+        callback: unsafe extern "C" fn(
+            *mut std::ffi::c_void,
+            u32,
+            *mut std::ffi::c_void,
+            *mut std::ffi::c_void,
+        ) -> *mut std::ffi::c_void,
+        user_info: *mut std::ffi::c_void,
+    ) -> *mut std::ffi::c_void;
+    fn CGEventTapEnable(tap: *mut std::ffi::c_void, enable: bool);
+    fn CGEventGetIntegerValueField(event: *mut std::ffi::c_void, field: i32) -> i64;
+}
+
+#[cfg(target_os = "macos")]
+#[link(name = "CoreFoundation", kind = "framework")]
+extern "C" {
+    fn CFMachPortCreateRunLoopSource(
+        allocator: *const std::ffi::c_void,
+        port: *mut std::ffi::c_void,
+        order: isize,
+    ) -> *mut std::ffi::c_void;
+    fn CFRunLoopAddSource(
+        rl: *mut std::ffi::c_void,
+        source: *mut std::ffi::c_void,
+        mode: *const std::ffi::c_void,
+    );
+    fn CFRunLoopGetCurrent() -> *mut std::ffi::c_void;
+    fn CFRunLoopRun();
+    static kCFRunLoopCommonModes: *const std::ffi::c_void;
+}
+
+// ── DB ──────────────────────────────────────────────────────────────────────
+
 struct Db(Mutex<Connection>);
 
 #[derive(Clone, serde::Serialize)]
@@ -20,8 +76,6 @@ struct KeyPressPayload {
     count: u64,
     key: String,
 }
-
-// ── DB init ────────────────────────────────────────────────────────────────
 
 fn init_db(conn: &Connection) {
     conn.execute_batch(
@@ -45,7 +99,6 @@ fn init_db(conn: &Connection) {
 
 fn load_today_count(conn: &Connection) -> u64 {
     let today = Local::now().format("%Y-%m-%d").to_string();
-
     conn.query_row(
         "SELECT total_keys FROM daily_stats WHERE date = ?1",
         params![today],
@@ -57,7 +110,6 @@ fn load_today_count(conn: &Connection) -> u64 {
 fn save_today_count(conn: &Connection, count: u64) {
     let today = Local::now().format("%Y-%m-%d").to_string();
     let now = Local::now().to_rfc3339();
-
     let _ = conn.execute(
         "INSERT INTO daily_stats (date, total_keys, updated_at)
          VALUES (?1, ?2, ?3)
@@ -66,7 +118,43 @@ fn save_today_count(conn: &Connection, count: u64) {
     );
 }
 
-// ── Tauri commands ─────────────────────────────────────────────────────────
+// ── Accessibility check ─────────────────────────────────────────────────────
+
+/// Returns true if Input Monitoring permission is granted.
+/// Automatically triggers the system prompt when status is unknown (first run).
+#[tauri::command]
+fn check_accessibility() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        // kIOHIDRequestTypeListenEvent = 1
+        let status = unsafe { IOHIDCheckAccess(1) };
+        match status {
+            0 => true,  // granted
+            2 => {
+                // unknown — show the system permission prompt
+                unsafe { IOHIDRequestAccess(1) };
+                false
+            }
+            _ => false, // denied
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        true
+    }
+}
+
+#[tauri::command]
+fn open_accessibility_settings() {
+    #[cfg(target_os = "macos")]
+    {
+        let _ = std::process::Command::new("open")
+            .arg("x-apple.systempreferences:com.apple.preference.security?Privacy_ListenEvent")
+            .spawn();
+    }
+}
+
+// ── Tauri commands ──────────────────────────────────────────────────────────
 
 #[tauri::command]
 fn get_keypress_count() -> u64 {
@@ -83,7 +171,6 @@ fn reset_keypress_count(db: State<Db>) {
 #[tauri::command]
 fn get_weekly_stats(db: State<Db>) -> Vec<serde_json::Value> {
     let conn = db.0.lock().unwrap();
-
     let mut stmt = conn
         .prepare(
             "SELECT date, total_keys FROM daily_stats
@@ -91,7 +178,6 @@ fn get_weekly_stats(db: State<Db>) -> Vec<serde_json::Value> {
              ORDER BY date ASC",
         )
         .unwrap();
-
     stmt.query_map([], |row| {
         Ok(serde_json::json!({
             "date": row.get::<_, String>(0)?,
@@ -108,7 +194,6 @@ async fn set_window_ignore_cursor(app: AppHandle, ignore: bool) -> Result<(), St
     let window = app
         .get_webview_window("main")
         .ok_or("no main window".to_string())?;
-
     window
         .set_ignore_cursor_events(ignore)
         .map_err(|e| e.to_string())
@@ -119,7 +204,6 @@ async fn analyze_typing(total_keys: u64, wpm: u32, api_key: String) -> Result<St
     if api_key.trim().is_empty() {
         return Ok(fun_fallback(total_keys, wpm));
     }
-
     let client = reqwest::Client::new();
     let prompt = format!(
         "用户今天的打字数据：总击键 {} 次，当前 WPM {}。\
@@ -128,18 +212,11 @@ async fn analyze_typing(total_keys: u64, wpm: u32, api_key: String) -> Result<St
          回复控制在 50 字以内。",
         total_keys, wpm
     );
-
     let body = serde_json::json!({
         "model": "claude-haiku-4-5-20251001",
         "max_tokens": 150,
-        "messages": [
-            {
-                "role": "user",
-                "content": prompt
-            }
-        ]
+        "messages": [{ "role": "user", "content": prompt }]
     });
-
     let resp = client
         .post("https://api.anthropic.com/v1/messages")
         .header("x-api-key", &api_key)
@@ -149,13 +226,11 @@ async fn analyze_typing(total_keys: u64, wpm: u32, api_key: String) -> Result<St
         .send()
         .await
         .map_err(|e| e.to_string())?;
-
     let json: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
     let text = json["content"][0]["text"]
         .as_str()
         .unwrap_or("Yamper 今天也很努力 🐾")
         .to_string();
-
     Ok(text)
 }
 
@@ -169,14 +244,10 @@ fn fun_fallback(total_keys: u64, wpm: u32) -> String {
     } else {
         "「摸鱼预备役」"
     };
-
-    format!(
-        "今天打了 {} 下，{} WPM，人设认定：{} ⚡",
-        total_keys, wpm, label
-    )
+    format!("今天打了 {} 下，{} WPM，人设认定：{} ⚡", total_keys, wpm, label)
 }
 
-// ── Keycode mapping ────────────────────────────────────────────────────────
+// ── Keycode mapping ─────────────────────────────────────────────────────────
 
 fn macos_keycode_to_name(code: u16) -> &'static str {
     match code {
@@ -207,87 +278,140 @@ fn macos_keycode_to_name(code: u16) -> &'static str {
     }
 }
 
-// ── Keyboard listener ──────────────────────────────────────────────────────
+// ── CGEventTap keyboard listener ─────────────────────────────────────────────
 
-fn start_keyboard_listener(app: AppHandle, db_path: std::path::PathBuf) {
-    use std::collections::HashSet;
-    use std::sync::Arc;
+#[cfg(target_os = "macos")]
+unsafe extern "C" fn cg_event_callback(
+    _proxy: *mut std::ffi::c_void,
+    event_type: u32,
+    event: *mut std::ffi::c_void,
+    _refcon: *mut std::ffi::c_void,
+) -> *mut std::ffi::c_void {
+    // kCGKeyboardEventKeycode field = 9
+    let key_code = CGEventGetIntegerValueField(event, 9) as u16;
+    let key_name = macos_keycode_to_name(key_code).to_string();
 
-    thread::spawn(move || {
-        use block2::RcBlock;
-        use objc2_app_kit::{NSEvent, NSEventType};
-        use objc2_foundation::NSRunLoop;
+    eprintln!("[kbd] event_type={} keycode={} key={}", event_type, key_code, key_name);
 
-        let conn = Arc::new(Mutex::new(
-            Connection::open(&db_path).expect("listener db open failed"),
-        ));
-        let conn_b = conn.clone();
+    let app = match GLOBAL_APP.get() {
+        Some(a) => a,
+        None => return event,
+    };
 
-        let flush_counter = Arc::new(std::sync::atomic::AtomicU32::new(0));
-        let flush_b = flush_counter.clone();
-
-        // Track pressed modifier keys to distinguish press from release
-        let pressed_mods: Arc<Mutex<HashSet<u16>>> =
-            Arc::new(Mutex::new(HashSet::new()));
-        let pressed_b = pressed_mods.clone();
-
-        let block = RcBlock::new(move |event: std::ptr::NonNull<NSEvent>| {
-            let event: &NSEvent = unsafe { event.as_ref() };
-            let key_code = unsafe { event.keyCode() };
-
-            let is_press = unsafe {
-                match event.r#type() {
-                    NSEventType::KeyDown => true,
-                    NSEventType::FlagsChanged => {
-                        let mut pressed = pressed_b.lock().unwrap();
+    match event_type {
+        10 => {
+            // kCGEventKeyDown — emit press; release comes from KeyUp (event 11)
+            let count = KEYPRESS_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+            let _ = app.emit("key-press", KeyPressPayload { count, key: key_name });
+            if count % 20 == 0 {
+                if let Some(conn_mutex) = GLOBAL_DB_CONN.get() {
+                    if let Ok(conn) = conn_mutex.try_lock() {
+                        save_today_count(&conn, count);
+                    }
+                }
+            }
+        }
+        11 => {
+            // kCGEventKeyUp — emit release immediately (zero delay)
+            let _ = app.emit("key-release", key_name);
+        }
+        12 => {
+            // kCGEventFlagsChanged — modifier keys
+            if key_code == 57 {
+                // CapsLock: macOS FlagsChanged fires on both press and release, but release
+                // detection is unreliable across OS versions. Match BongoCat's approach:
+                // treat every FlagsChanged as a tap — press immediately, auto-release after
+                // 150 ms. The gen counter debounces rapid events (press+release pair) so
+                // only the LAST timer fires, preventing a stuck "no hand" state.
+                static CAPS_GEN: AtomicU64 = AtomicU64::new(0);
+                let gen = CAPS_GEN.fetch_add(1, Ordering::Relaxed) + 1;
+                let count = KEYPRESS_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+                let _ = app.emit("key-press", KeyPressPayload { count, key: key_name.clone() });
+                let app_rel = app.clone();
+                thread::spawn(move || {
+                    thread::sleep(std::time::Duration::from_millis(150));
+                    if CAPS_GEN.load(Ordering::Relaxed) == gen {
+                        let _ = app_rel.emit("key-release", key_name);
+                    }
+                });
+            } else {
+                // Other modifier keys: FlagsChanged fires on press AND release,
+                // so toggle in/out of pressed set to track state.
+                if let Some(pressed_mods) = GLOBAL_PRESSED_MODS.get() {
+                    if let Ok(mut pressed) = pressed_mods.try_lock() {
                         if pressed.contains(&key_code) {
                             pressed.remove(&key_code);
-                            false // release
+                            let _ = app.emit("key-release", key_name);
                         } else {
                             pressed.insert(key_code);
-                            true // press
+                            let count = KEYPRESS_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+                            let _ = app.emit("key-press", KeyPressPayload { count, key: key_name });
                         }
                     }
-                    _ => false,
                 }
+            }
+        }
+        _ => {}
+    }
+
+    event
+}
+
+fn start_keyboard_listener(app: AppHandle, db_path: std::path::PathBuf) {
+    thread::spawn(move || {
+        #[cfg(target_os = "macos")]
+        {
+            // Initialize globals for the C callback
+            let conn = Connection::open(&db_path).expect("listener db open failed");
+            let _ = GLOBAL_APP.set(app);
+            let _ = GLOBAL_DB_CONN.set(Mutex::new(conn));
+            let _ = GLOBAL_PRESSED_MODS.set(Mutex::new(HashSet::new()));
+
+            // kCGEventKeyDown=10, kCGEventKeyUp=11, kCGEventFlagsChanged=12
+            let mask: u64 = (1u64 << 10) | (1u64 << 11) | (1u64 << 12);
+
+            let tap = unsafe {
+                CGEventTapCreate(
+                    1, // kCGSessionEventTap — needs Input Monitoring (grantable to CLI binaries)
+                    0, // kCGHeadInsertEventTap
+                    1, // kCGEventTapOptionListenOnly (passive, doesn't block events)
+                    mask,
+                    cg_event_callback,
+                    std::ptr::null_mut(),
+                )
             };
 
-            if !is_press {
+            eprintln!("[kbd] CGEventTap created: {}", !tap.is_null());
+
+            if tap.is_null() {
+                eprintln!("[kbd] Failed to create CGEventTap — check Accessibility/Input Monitoring permission");
                 return;
             }
 
-            let key_name = macos_keycode_to_name(key_code).to_string();
-            let count = KEYPRESS_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
-            let _ = app.emit("key-press", KeyPressPayload { count, key: key_name });
-
-            let n = flush_b.fetch_add(1, Ordering::Relaxed) + 1;
-            if n % 20 == 0 {
-                save_today_count(&conn_b.lock().unwrap(), count);
+            unsafe {
+                let source = CFMachPortCreateRunLoopSource(std::ptr::null(), tap, 0);
+                CGEventTapEnable(tap, true);
+                let rl = CFRunLoopGetCurrent();
+                CFRunLoopAddSource(rl, source, kCFRunLoopCommonModes);
+                CFRunLoopRun();
             }
-        });
-
-        // KeyDown = 1<<10, FlagsChanged = 1<<12
-        let mask: u64 = (1u64 << 10) | (1u64 << 12);
-        let _monitor: Option<objc2::rc::Retained<objc2::runtime::AnyObject>> = unsafe {
-            objc2::msg_send_id![
-                objc2::class!(NSEvent),
-                addGlobalMonitorForEventsMatchingMask: mask,
-                handler: &*block
-            ]
-        };
-
-        // Block this thread on its run loop so events are delivered
-        unsafe { NSRunLoop::currentRunLoop().run() };
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = (app, db_path);
+        }
     });
 }
 
-// ── App entry ──────────────────────────────────────────────────────────────
+// ── App entry ───────────────────────────────────────────────────────────────
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .invoke_handler(tauri::generate_handler![
+            check_accessibility,
+            open_accessibility_settings,
             get_keypress_count,
             reset_keypress_count,
             get_weekly_stats,

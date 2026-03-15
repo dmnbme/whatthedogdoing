@@ -15,12 +15,28 @@
         @mousedown.left="onDogMouseDown"
         :title="passThroughEnabled ? '当前是穿透模式，按 Ctrl+Shift+D 恢复交互' : '按住可以拖动'"
       >
-        <img
-          :src="currentFrame"
-          class="dog-sprite"
-          draggable="false"
-          alt="yamper"
-        />
+        <!-- 底层：没手的狗 + 键盘，始终显示 -->
+        <img class="dog-sprite layer-base"
+             :src="'/sprites/idle.png'"
+             draggable="false" alt="base" />
+
+        <!-- 手部：无键按下时显示 -->
+        <img v-if="activeKeys.size === 0"
+             class="dog-sprite layer-hand"
+             :src="'/sprites/hand.png'"
+             draggable="false" alt="" />
+
+        <!-- 按键层：对应键按下时显示 -->
+        <template v-for="code in activeKeys" :key="code">
+          <img
+            v-if="KEY_TO_FILE[code]"
+            class="dog-sprite layer-key"
+            :src="keySpriteSrc(code)"
+            draggable="false"
+            :alt="code"
+            @error="(e) => ((e.target as HTMLImageElement).style.display = 'none')"
+          />
+        </template>
       </div>
     </div>
 
@@ -85,6 +101,17 @@
         已开启穿透（Ctrl+Shift+D 恢复）
       </div>
     </Transition>
+
+    <!-- 输入监控权限提示 -->
+    <Transition name="fade">
+      <div v-if="showAccessibilityAlert" class="accessibility-alert" @mousedown.stop>
+        <div class="ax-icon">⌨️</div>
+        <div class="ax-title">需要「输入监控」权限</div>
+        <div class="ax-desc">系统设置 → 隐私与安全性 → 输入监控，添加本应用后重启</div>
+        <button class="ax-btn" @click="openAccessibilitySettings">去授权</button>
+        <button class="ax-dismiss" @click="showAccessibilityAlert = false">稍后</button>
+      </div>
+    </Transition>
   </div>
 </template>
 
@@ -94,10 +121,46 @@ import { listen } from '@tauri-apps/api/event'
 import { invoke } from '@tauri-apps/api/core'
 import { getCurrentWindow } from '@tauri-apps/api/window'
 
-const IDLE_SPRITE = '/sprites/idle.png'
-
 type WeekStat = { date: string; keys: number }
 type KeyPressPayload = { count: number; key: string }
+
+// Maps Rust key names → actual sprite filenames (without .png)
+const KEY_TO_FILE: Record<string, string> = {
+  // Letters
+  KeyA: 'A', KeyB: 'B', KeyC: 'C', KeyD: 'D', KeyE: 'E',
+  KeyF: 'F', KeyG: 'G', KeyH: 'H', KeyI: 'I', KeyJ: 'J',
+  KeyK: 'K', KeyL: 'L', KeyM: 'M', KeyN: 'N', KeyO: 'O',
+  KeyP: 'P', KeyQ: 'Q', KeyR: 'R', KeyS: 'S', KeyT: 'T',
+  KeyU: 'U', KeyV: 'V', KeyW: 'W', KeyX: 'X', KeyY: 'Y', KeyZ: 'Z',
+  // Digits
+  Digit0: '0', Digit1: '1', Digit2: '2', Digit3: '3', Digit4: '4',
+  Digit5: '5', Digit6: '6', Digit7: '7', Digit8: '8', Digit9: '9',
+  // Punctuation
+  Comma: ',', Period: 'Dot', Minus: '-', Equal: '+',
+  BracketLeft: '[', BracketRight: ']', Backslash: 'backslash', Slash: 'slash',
+  Quote: "'", Backquote: '~', Semicolon: ';',
+  // Control keys
+  Space: 'Space', Return: 'Return', Tab: 'Tab',
+  Backspace: 'Delete', Escape: 'Esc', Delete: 'Delete',
+  // Modifiers
+  ShiftLeft: 'Shift Left', ShiftRight: 'Shift R',
+  MetaLeft: 'Command left', MetaRight: 'Command right',
+  ControlLeft: 'Control', ControlRight: 'Control',
+  Alt: 'Option left', AltRight: 'Option right',
+  CapsLock: 'Caps lock',
+  // Arrows
+  ArrowLeft: 'Left arrow', ArrowRight: 'Right Arrow',
+  ArrowDown: 'Down arrow', ArrowUp: 'Up arrow',
+  // Function keys
+  F1: 'F1', F2: 'F2', F3: 'F3', F4: 'F4', F5: 'F5', F6: 'F6',
+  F7: 'F7', F8: 'F8', F9: 'F9', F10: 'F10', F11: 'F11', F12: 'F12',
+}
+
+function keySpriteSrc(code: string): string {
+  const filename = KEY_TO_FILE[code]
+  if (!filename) return '/sprites/keyboard/_none.png'
+  return `/sprites/keyboard/${encodeURIComponent(filename)}.png`
+}
 
 const todayCount = ref(0)
 const recentKeys = ref<number[]>([])
@@ -106,23 +169,23 @@ const aiAnalysis = ref('')
 const isLoading = ref(false)
 const apiKey = ref(localStorage.getItem('claude_api_key') ?? '')
 const weekStats = ref<WeekStat[]>([])
-const lastKey = ref('')
+
+const activeKeys = ref<Set<string>>(new Set())
 
 const isDragging = ref(false)
 const passThroughEnabled = ref(false)
 const showDebugBorder = ref(false)
 const showPassthroughHint = ref(false)
+const showAccessibilityAlert = ref(false)
 let passthroughHintTimer: ReturnType<typeof setTimeout> | null = null
 const currentIgnoreState = ref<boolean | null>(null)
 
-let activeKeyTimer: ReturnType<typeof setTimeout> | null = null
 let unlistenKeyPress: (() => void) | null = null
+let unlistenKeyRelease: (() => void) | null = null
 let unlistenTogglePassThrough: (() => void) | null = null
 let unlistenTrayAI: (() => void) | null = null
 let unlistenTrayStats: (() => void) | null = null
 
-
-const currentFrame = computed(() => IDLE_SPRITE)
 
 const currentWPM = computed(() => {
   const now = Date.now()
@@ -187,16 +250,18 @@ async function togglePassThrough() {
 
 function onKeyPress(count: number, key: string) {
   todayCount.value = count
-  lastKey.value = key
-
-  if (activeKeyTimer) clearTimeout(activeKeyTimer)
-  activeKeyTimer = setTimeout(() => {
-    lastKey.value = ''
-  }, 420)
-
+  const next = new Set(activeKeys.value)
+  next.add(key)
+  activeKeys.value = next
   const now = Date.now()
   recentKeys.value.push(now)
   recentKeys.value = recentKeys.value.filter((t) => now - t < 60000)
+}
+
+function onKeyRelease(key: string) {
+  const s = new Set(activeKeys.value)
+  s.delete(key)
+  activeKeys.value = s
 }
 
 async function getAIAnalysis() {
@@ -287,21 +352,9 @@ async function closeAI() {
   await syncWindowMode()
 }
 
-async function handleKeydown(e: KeyboardEvent) {
-  if (e.key === 'F8') {
-    e.preventDefault()
-    await togglePassThrough()
-  }
-
-  if (e.key === 'Escape') {
-    if (showPanel.value) {
-      await closePanel()
-      return
-    }
-    if (aiAnalysis.value) {
-      await closeAI()
-    }
-  }
+async function openAccessibilitySettings() {
+  await invoke('open_accessibility_settings')
+  showAccessibilityAlert.value = false
 }
 
 watch(showPanel, async () => {
@@ -318,6 +371,13 @@ watch(passThroughEnabled, async () => {
 
 onMounted(async () => {
   try {
+    const trusted = await invoke<boolean>('check_accessibility')
+    if (!trusted) showAccessibilityAlert.value = true
+  } catch (err) {
+    console.error('check_accessibility failed:', err)
+  }
+
+  try {
     todayCount.value = await invoke<number>('get_keypress_count')
   } catch (err) {
     console.error('get_keypress_count failed:', err)
@@ -326,6 +386,9 @@ onMounted(async () => {
   try {
     unlistenKeyPress = await listen<KeyPressPayload>('key-press', (e) => {
       onKeyPress(e.payload.count, e.payload.key)
+    })
+    unlistenKeyRelease = await listen<string>('key-release', (e) => {
+      onKeyRelease(e.payload)
     })
 
     unlistenTogglePassThrough = await listen('toggle-pass-through', async () => {
@@ -344,11 +407,11 @@ onMounted(async () => {
 
 onUnmounted(() => {
   unlistenKeyPress?.()
+  unlistenKeyRelease?.()
   unlistenTogglePassThrough?.()
   unlistenTrayAI?.()
   unlistenTrayStats?.()
 
-  if (activeKeyTimer) clearTimeout(activeKeyTimer)
   if (passthroughHintTimer) clearTimeout(passthroughHintTimer)
 })
 </script>
@@ -447,6 +510,13 @@ body {
   image-rendering: pixelated;
   filter: drop-shadow(0 6px 12px rgba(0, 0, 0, 0.28));
   pointer-events: none;
+}
+
+.layer-base,
+.layer-hand,
+.layer-key {
+  position: absolute;
+  inset: 0;
 }
 
 
@@ -604,6 +674,67 @@ body {
   backdrop-filter: blur(8px);
 }
 
+
+.accessibility-alert {
+  position: absolute;
+  inset: 0;
+  background: rgba(10, 10, 24, 0.94);
+  backdrop-filter: blur(12px);
+  border-radius: 16px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  padding: 24px 20px;
+  z-index: 20;
+  text-align: center;
+}
+
+.ax-icon {
+  font-size: 32px;
+}
+
+.ax-title {
+  color: #fff;
+  font-size: 14px;
+  font-weight: 700;
+}
+
+.ax-desc {
+  color: #aaa;
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.ax-btn {
+  margin-top: 8px;
+  background: linear-gradient(135deg, #a78bfa, #60a5fa);
+  border: none;
+  border-radius: 8px;
+  color: #fff;
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 700;
+  padding: 7px 18px;
+}
+
+.ax-btn:hover {
+  opacity: 0.88;
+}
+
+.ax-dismiss {
+  background: none;
+  border: none;
+  color: #666;
+  cursor: pointer;
+  font-size: 11px;
+}
+
+.ax-dismiss:hover {
+  color: #999;
+}
 
 .fade-enter-active,
 .fade-leave-active {

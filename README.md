@@ -6,11 +6,7 @@
 
 Built at **UNIHACK 2026** in 48 hours.
 
----
 
-![WhatTheDogDoin banner]()
-
----
 
 ## Features
 

@@ -22,7 +22,7 @@ Built at **UNIHACK 2026** in 48 hours.
 
 ## Demo
 
-[Click to watch](media/demo.mp4)
+[Click to watch](https://youtu.be/dL4jmDyBoqk)
 
 ---
 

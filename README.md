@@ -6,7 +6,7 @@
 
 Built at **UNIHACK 2026** in 48 hours.
 
-
+![WhatTheDogDoin Banner](media/banner32.jpg)
 
 ## Features
 
@@ -22,7 +22,7 @@ Built at **UNIHACK 2026** in 48 hours.
 
 ## Demo
 
-> *Video coming soon*
+<video src="media/demo.mp4" controls width="100%"></video>
 
 ---
 
